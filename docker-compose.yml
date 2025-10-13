@@ -8,10 +8,15 @@ services:
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running", "-q"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
 
   users:
     build:
-      context: .                     # << agora é a raiz do projeto
+      context: .
       dockerfile: ./services/users-service/Dockerfile
     container_name: ms_users
     environment:
@@ -19,13 +24,20 @@ services:
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
       EXCHANGE: app.topic
     depends_on:
-      - rabbitmq
+      rabbitmq:
+        condition: service_healthy
     ports:
       - "3001:3001"
+    # ADICIONADO: Garante que o servidor web está pronto
+    healthcheck:
+      test: "curl -f http://localhost:3001/health || exit 1"
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   orders:
     build:
-      context: .                     # << agora é a raiz do projeto
+      context: .
       dockerfile: ./services/orders-service/Dockerfile
     container_name: ms_orders
     environment:
@@ -37,8 +49,10 @@ services:
       QUEUE: orders.q
       ROUTING_KEY_USER_CREATED: user.created
     depends_on:
-      - rabbitmq
-      - users
+      rabbitmq:
+        condition: service_healthy
+      users:
+        condition: service_healthy # MODIFICADO para esperar o users ficar saudável
     ports:
       - "3002:3002"
 
@@ -52,7 +66,10 @@ services:
       USERS_URL: http://users:3001
       ORDERS_URL: http://orders:3002
     depends_on:
-      - users
-      - orders
+      # MODIFICADO: Agora espera os serviços estarem saudáveis
+      users:
+        condition: service_healthy
+      orders:
+        condition: service_started
     ports:
       - "3000:3000"

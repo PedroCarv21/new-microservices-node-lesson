@@ -32,6 +32,9 @@ app.get('/', (req, res) => {
 });
 
 app.post('/', async (req, res) => {
+
+  console.log('>>> [users] REQUISIÇÃO RECEBIDA NO HANDLER POST <<<');
+
   const { name, email } = req.body || {};
   if (!name || !email) return res.status(400).json({ error: 'name and email are required' });
 
@@ -39,7 +42,10 @@ app.post('/', async (req, res) => {
   const user = { id, name, email, createdAt: new Date().toISOString() };
   users.set(id, user);
 
-  // Publish event
+  // >> PASSO 1: Envie a resposta IMEDIATAMENTE.
+  res.status(201).json(user);
+
+  // >> PASSO 2: Tente publicar o evento em segundo plano.
   try {
     if (amqp?.ch) {
       const payload = Buffer.from(JSON.stringify(user));
@@ -49,14 +55,6 @@ app.post('/', async (req, res) => {
   } catch (err) {
     console.error('[users] publish error:', err.message);
   }
-
-  res.status(201).json(user);
-});
-
-app.get('/:id', (req, res) => {
-  const user = users.get(req.params.id);
-  if (!user) return res.status(404).json({ error: 'not found' });
-  res.json(user);
 });
 
 app.listen(PORT, () => {
