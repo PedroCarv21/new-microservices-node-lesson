@@ -27,11 +27,11 @@ let amqp = null;
 
 app.get('/health', (req, res) => res.json({ ok: true, service: 'users' }));
 
-app.get('/', (req, res) => {
+app.get('/users', (req, res) => {
   res.json(Array.from(users.values()));
 });
 
-app.post('/', async (req, res) => {
+app.post('/users', async (req, res) => {
 
   console.log('>>> [users] REQUISIÇÃO RECEBIDA NO HANDLER POST <<<');
 
