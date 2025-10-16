@@ -57,6 +57,12 @@ app.post('/', async (req, res) => {
   }
 });
 
+app.get('/:id', (req, res) => {
+  const user = users.get(req.params.id);
+  if (!user) return res.status(404).json({ error: 'user not found' });
+  res.json(user);
+});
+
 app.listen(PORT, () => {
   console.log(`[users] listening on http://localhost:${PORT}`);
 });

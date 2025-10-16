@@ -7,14 +7,14 @@ const app = express();
 app.use(morgan('dev'));
 
 const PORT = process.env.PORT || 3000;
-const USERS_URL = process.env.USERS_URL || 'http://localhost:3001';
-const ORDERS_URL = process.env.ORDERS_URL || 'http://localhost:3002';
+const USERS_URL = process.env.USERS_URL || 'http://users:3001';
+const ORDERS_URL = process.env.ORDERS_URL || 'http://orders:3002';
 
 // Roteamento de APIs
 app.use('/users', createProxyMiddleware({
   target: USERS_URL,
   changeOrigin: true,
-  pathRewrite: {'^/users': ''},
+  // pathRewrite: {'^/users': ''},
   onProxyReq: (proxyReq, req, res) => {
     if (req.body){
         const bodyData = JSON.stringify(req.body);
