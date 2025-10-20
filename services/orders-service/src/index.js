@@ -16,6 +16,7 @@ const RABBITMQ_URL = process.env.RABBITMQ_URL || 'amqp://guest:guest@localhost:5
 const EXCHANGE = process.env.EXCHANGE || 'app.topic';
 const QUEUE = process.env.QUEUE || 'orders.q';
 const ROUTING_KEY_USER_CREATED = process.env.ROUTING_KEY_USER_CREATED || ROUTING_KEYS.USER_CREATED;
+const ROUTING_KEY_USER_UPDATED = process.env.ROUTING_KEY_USER_UPDATED || ROUTING_KEYS.USER_UPDATED;
 
 // In-memory "DB"
 const orders = new Map();
@@ -31,14 +32,22 @@ let amqp = null;
     // Bind de fila para consumir eventos user.created
     await amqp.ch.assertQueue(QUEUE, { durable: true });
     await amqp.ch.bindQueue(QUEUE, EXCHANGE, ROUTING_KEY_USER_CREATED);
+    await amqp.ch.bindQueue(QUEUE, EXCHANGE, ROUTING_KEY_USER_UPDATED);
 
     amqp.ch.consume(QUEUE, msg => {
       if (!msg) return;
       try {
         const user = JSON.parse(msg.content.toString());
+        const key = msg.fields.routingKey;
         // idempotência simples: atualiza/define
-        userCache.set(user.id, user);
-        console.log('[orders] consumed event user.created -> cached', user.id);
+        if (key === ROUTING_KEY_USER_CREATED) {
+          userCache.set(data.id, data);
+          console.log('[orders] consumed event user.created -> cached', data.id);
+        } else if (key === ROUTING_KEY_USER_UPDATED) {
+          userCache.set(data.id, data); // A lógica é a mesma: atualizar/definir
+          console.log('[orders] consumed event user.updated -> cache updated', data.id);
+        }
+        
         amqp.ch.ack(msg);
       } catch (err) {
         console.error('[orders] consume error:', err.message);
@@ -100,6 +109,32 @@ app.post('/', async (req, res) => {
   }
 
   res.status(201).json(order);
+});
+
+app.patch('/:id', async (req, res) => {
+  const { id } = req.params;
+  
+  if (!orders.has(id)) {
+    return res.status(404).json({ error: 'order not found' });
+  }
+
+  const order = orders.get(id);
+  order.status = 'cancelled'; // Atualiza o status do pedido
+
+  orders.set(id, order); // Salva a atualização no "DB"
+
+  // Publica o evento 'order.cancelled'
+  try {
+    if (amqp?.ch) {
+      const payload = Buffer.from(JSON.stringify(order));
+      amqp.ch.publish(EXCHANGE, ROUTING_KEYS.ORDER_CANCELLED, payload, { persistent: true });
+      console.log('[orders] published event:', ROUTING_KEYS.ORDER_CANCELLED, order.id);
+    }
+  } catch (err) {
+    console.error('[orders] publish error:', err.message);
+  }
+  
+  res.status(200).json(order); // Retorna o pedido atualizado
 });
 
 app.listen(PORT, () => {

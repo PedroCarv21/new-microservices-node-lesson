@@ -57,6 +57,36 @@ app.post('/', async (req, res) => {
   }
 });
 
+app.patch('/:id', async (req, res) => {
+  const { id } = req.params;
+  const { name, email } = req.body;
+
+  if (!users.has(id)) {
+    return res.status(404).json({ error: 'user not found' });
+  }
+
+  const user = users.get(id);
+
+  // Atualiza apenas os campos que foram enviados
+  if (name) user.name = name;
+  if (email) user.email = email;
+
+  users.set(id, user); // Salva o usuário atualizado no "DB"
+
+  // Publica o evento 'user.updated'
+  try {
+    if (amqp?.ch) {
+      const payload = Buffer.from(JSON.stringify(user));
+      amqp.ch.publish(EXCHANGE, ROUTING_KEYS.USER_UPDATED, payload, { persistent: true });
+      console.log('[users] published event:', ROUTING_KEYS.USER_UPDATED, user);
+    }
+  } catch (err) {
+    console.error('[users] publish error:', err.message);
+  }
+
+  res.status(200).json(user); // Retorna o usuário atualizado
+});
+
 app.get('/:id', (req, res) => {
   const user = users.get(req.params.id);
   if (!user) return res.status(404).json({ error: 'user not found' });
