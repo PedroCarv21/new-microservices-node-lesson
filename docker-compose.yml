@@ -51,6 +51,7 @@ services:
       EXCHANGE: app.topic
       QUEUE: orders.q
       ROUTING_KEY_USER_CREATED: user.created
+      DATABASE_URL: "file:/app/prisma/orders.db"
     depends_on:
       rabbitmq:
         condition: service_healthy
@@ -58,6 +59,8 @@ services:
         condition: service_healthy
     ports:
       - "3002:3002"
+    volumes:
+      - orders-db-data:/app/prisma
 
   gateway:
     build:
@@ -78,3 +81,4 @@ services:
 
 volumes:
   users-db-data:
+  orders-db-data:

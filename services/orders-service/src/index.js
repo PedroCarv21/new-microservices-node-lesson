@@ -1,13 +1,17 @@
 import express from 'express';
 import morgan from 'morgan';
 import fetch from 'node-fetch';
-import { nanoid } from 'nanoid';
+// import { nanoid } from 'nanoid';
 import { createChannel } from './amqp.js';
 import { ROUTING_KEYS } from '../common/events.js';
+import { PrismaClient } from '@prisma/client';
+
 
 const app = express();
 app.use(express.json());
 app.use(morgan('dev'));
+
+const prisma = new PrismaClient();
 
 const PORT = process.env.PORT || 3002;
 const USERS_BASE_URL = process.env.USERS_BASE_URL || 'http://localhost:3001';
@@ -19,7 +23,7 @@ const ROUTING_KEY_USER_CREATED = process.env.ROUTING_KEY_USER_CREATED || ROUTING
 const ROUTING_KEY_USER_UPDATED = process.env.ROUTING_KEY_USER_UPDATED || ROUTING_KEYS.USER_UPDATED;
 
 // In-memory "DB"
-const orders = new Map();
+// const orders = new Map();
 // In-memory cache de usuários (preenchido por eventos)
 const userCache = new Map();
 
@@ -61,8 +65,19 @@ let amqp = null;
 
 app.get('/health', (req, res) => res.json({ ok: true, service: 'orders' }));
 
-app.get('/', (req, res) => {
-  res.json(Array.from(orders.values()));
+app.get('/', async (req, res) => {
+  try {
+    const ordersFromDb = await prisma.order.findMany();
+
+    const orders = ordersFromDb.map(order => ({
+      ...order,
+      items: JSON.parse(order.items)
+    }));
+    res.json(orders);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Falha ao buscar pedidos' });
+  }
 });
 
 async function fetchWithTimeout(url, ms) {
@@ -94,50 +109,84 @@ app.post('/', async (req, res) => {
     }
   }
 
-  const id = `o_${nanoid(6)}`;
-  const order = { id, userId, items, total, status: 'created', createdAt: new Date().toISOString() };
-  orders.set(id, order);
-
-  // (Opcional) publicar evento order.created
   try {
-    if (amqp?.ch) {
-      amqp.ch.publish(EXCHANGE, ROUTING_KEYS.ORDER_CREATED, Buffer.from(JSON.stringify(order)), { persistent: true });
-      console.log('[orders] published event:', ROUTING_KEYS.ORDER_CREATED, order.id);
-    }
-  } catch (err) {
-    console.error('[orders] publish error:', err.message);
-  }
+    const order = await prisma.order.create({
+      data: {
+        userId: userId,
+        total: total,
+        status: 'created',
+        // ATUALIZADO: Converte o array de 'items' para uma string JSON
+        items: JSON.stringify(items)
+      }
+    });
 
-  res.status(201).json(order);
+    try {
+      if (amqp?.ch) {
+        amqp.ch.publish(EXCHANGE, ROUTING_KEYS.ORDER_CREATED, Buffer.from(JSON.stringify(order)), { persistent: true });
+        console.log('[orders] published event:', ROUTING_KEYS.ORDER_CREATED, order.id);
+      }
+    } catch (err) {
+      console.error('[orders] publish error:', err.message);
+    }
+
+    // ATUALIZADO: Converte a string 'items' de volta para JSON para a resposta
+    res.status(201).json({
+      ...order,
+      items: JSON.parse(order.items)
+    });
+
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Falha ao criar pedido' });
+  }
 });
 
 app.patch('/:id', async (req, res) => {
   const { id } = req.params;
-  
-  if (!orders.has(id)) {
-    return res.status(404).json({ error: 'order not found' });
-  }
 
-  const order = orders.get(id);
-  order.status = 'cancelled'; // Atualiza o status do pedido
-
-  orders.set(id, order); // Salva a atualização no "DB"
-
-  // Publica o evento 'order.cancelled'
   try {
-    if (amqp?.ch) {
-      const payload = Buffer.from(JSON.stringify(order));
-      amqp.ch.publish(EXCHANGE, ROUTING_KEYS.ORDER_CANCELLED, payload, { persistent: true });
-      console.log('[orders] published event:', ROUTING_KEYS.ORDER_CANCELLED, order.id);
+    const order = await prisma.order.update({
+      where: { id: id },
+      data: {
+        status: 'cancelled'
+      }
+    });
+
+    // Publica o evento (não muda)
+    try {
+      if (amqp?.ch) {
+        const payload = Buffer.from(JSON.stringify(order));
+        amqp.ch.publish(EXCHANGE, ROUTING_KEYS.ORDER_CANCELLED, payload, { persistent: true });
+        console.log('[orders] published event:', ROUTING_KEYS.ORDER_CANCELLED, order.id);
+      }
+    } catch (err) {
+      console.error('[orders] publish error:', err.message);
     }
-  } catch (err) {
-    console.error('[orders] publish error:', err.message);
+    
+    // ATUALIZADO: Converte a string 'items' de volta para JSON para a resposta
+    res.status(200).json({
+      ...order,
+      items: JSON.parse(order.items)
+    });
+
+  } catch (error) {
+    if (error.code === 'P2025') { // 'Record to update not found'
+      return res.status(404).json({ error: 'order not found' });
+    }
+    console.error(error);
+    res.status(500).json({ error: 'Falha ao atualizar pedido' });
   }
-  
-  res.status(200).json(order); // Retorna o pedido atualizado
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`[orders] listening on http://localhost:${PORT}`);
   console.log(`[orders] users base url: ${USERS_BASE_URL}`);
+});
+
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM signal received: closing HTTP server');
+  await prisma.$disconnect();
+  server.close(() => {
+    console.log('HTTP server closed');
+  });
 });

@@ -1,0 +1,25 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  // O banco de dados se chamará 'orders.db'
+  url      = "file:./orders.db"
+}
+
+// Definição do nosso modelo de Pedido (Order)
+model Order {
+  id        String   @id @default(cuid())
+  userId    String   // O ID do usuário que fez o pedido
+  
+  // O Prisma não suporta arrays de objetos no SQLite.
+  // Vamos armazenar os 'items' como uma string de texto JSON.
+  items     String   
+  
+  total     Float
+  status    String   @default("created")
+  createdAt DateTime @default(now())
+
+  @@map("orders")
+}
