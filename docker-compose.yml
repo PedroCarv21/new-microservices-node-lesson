@@ -23,18 +23,20 @@ services:
       PORT: 3001
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672
       EXCHANGE: app.topic
+      DATABASE_URL: "file:/app/prisma/dev.db"
     depends_on:
       rabbitmq:
         condition: service_healthy
     ports:
       - "3001:3001"
-    # ADICIONADO: Garante que o servidor web está pronto
     healthcheck:
       test: "curl -f http://localhost:3001/health || exit 1"
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
+    volumes:
+      - users-db-data:/app/prisma
 
   orders:
     build:
@@ -53,7 +55,7 @@ services:
       rabbitmq:
         condition: service_healthy
       users:
-        condition: service_healthy # MODIFICADO para esperar o users ficar saudável
+        condition: service_healthy
     ports:
       - "3002:3002"
 
@@ -67,10 +69,12 @@ services:
       USERS_URL: http://users:3001
       ORDERS_URL: http://orders:3002
     depends_on:
-      # MODIFICADO: Agora espera os serviços estarem saudáveis
       users:
         condition: service_healthy
       orders:
         condition: service_started
     ports:
       - "3000:3000"
+
+volumes:
+  users-db-data:

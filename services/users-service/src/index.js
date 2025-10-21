@@ -1,19 +1,22 @@
 import express from 'express';
 import morgan from 'morgan';
-import { nanoid } from 'nanoid';
+// import { nanoid } from 'nanoid';
 import { createChannel } from './amqp.js';
 import { ROUTING_KEYS } from '../common/events.js';
+import { PrismaClient } from '@prisma/client';
 
 const app = express();
 app.use(express.json());
 app.use(morgan('dev'));
+
+const prisma = new PrismaClient();
 
 const PORT = process.env.PORT || 3001;
 const RABBITMQ_URL = process.env.RABBITMQ_URL || 'amqp://guest:guest@localhost:5672';
 const EXCHANGE = process.env.EXCHANGE || 'app.topic';
 
 // In-memory "DB"
-const users = new Map();
+// const users = new Map();
 
 let amqp = null;
 (async () => {
@@ -27,33 +30,49 @@ let amqp = null;
 
 app.get('/health', (req, res) => res.json({ ok: true, service: 'users' }));
 
-app.get('/', (req, res) => {
-  res.json(Array.from(users.values()));
+app.get('/', async (req, res) => {
+  try {
+    const users = await prisma.user.findMany();
+    res.json(users);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Falha ao buscar usuários' });
+  }
 });
 
 app.post('/', async (req, res) => {
-
-  console.log('>>> [users] REQUISIÇÃO RECEBIDA NO HANDLER POST <<<');
-
   const { name, email } = req.body || {};
   if (!name || !email) return res.status(400).json({ error: 'name and email are required' });
 
-  const id = `u_${nanoid(6)}`;
-  const user = { id, name, email, createdAt: new Date().toISOString() };
-  users.set(id, user);
-
-  // >> PASSO 1: Envie a resposta IMEDIATAMENTE.
-  res.status(201).json(user);
-
-  // >> PASSO 2: Tente publicar o evento em segundo plano.
   try {
-    if (amqp?.ch) {
-      const payload = Buffer.from(JSON.stringify(user));
-      amqp.ch.publish(EXCHANGE, ROUTING_KEYS.USER_CREATED, payload, { persistent: true });
-      console.log('[users] published event:', ROUTING_KEYS.USER_CREATED, user);
+    const user = await prisma.user.create({
+      data: {
+        name: name,
+        email: email,
+        // O ID e createdAt são gerados automaticamente pelo Prisma
+      }
+    });
+
+    res.status(201).json(user); // Responde imediatamente
+
+    // Publica o evento em segundo plano
+    try {
+      if (amqp?.ch) {
+        const payload = Buffer.from(JSON.stringify(user));
+        amqp.ch.publish(EXCHANGE, ROUTING_KEYS.USER_CREATED, payload, { persistent: true });
+        console.log('[users] published event:', ROUTING_KEYS.USER_CREATED, user);
+      }
+    } catch (err) {
+      console.error('[users] publish error:', err.message);
     }
-  } catch (err) {
-    console.error('[users] publish error:', err.message);
+
+  } catch (error) {
+    // Adiciona tratamento de erro (ex: email duplicado)
+    if (error.code === 'P2002') { // Código de erro do Prisma para 'unique constraint violation'
+      return res.status(400).json({ error: 'Email já cadastrado' });
+    }
+    console.error(error);
+    res.status(500).json({ error: 'Falha ao criar usuário' });
   }
 });
 
@@ -61,38 +80,59 @@ app.patch('/:id', async (req, res) => {
   const { id } = req.params;
   const { name, email } = req.body;
 
-  if (!users.has(id)) {
-    return res.status(404).json({ error: 'user not found' });
-  }
-
-  const user = users.get(id);
-
-  // Atualiza apenas os campos que foram enviados
-  if (name) user.name = name;
-  if (email) user.email = email;
-
-  users.set(id, user); // Salva o usuário atualizado no "DB"
-
-  // Publica o evento 'user.updated'
   try {
-    if (amqp?.ch) {
-      const payload = Buffer.from(JSON.stringify(user));
-      amqp.ch.publish(EXCHANGE, ROUTING_KEYS.USER_UPDATED, payload, { persistent: true });
-      console.log('[users] published event:', ROUTING_KEYS.USER_UPDATED, user);
+    const user = await prisma.user.update({
+      where: { id: id },
+      data: {
+        name: name, // O Prisma ignora campos undefined
+        email: email
+      }
+    });
+
+    // Publica o evento 'user.updated'
+    try {
+      if (amqp?.ch) {
+        const payload = Buffer.from(JSON.stringify(user));
+        amqp.ch.publish(EXCHANGE, ROUTING_KEYS.USER_UPDATED, payload, { persistent: true });
+        console.log('[users] published event:', ROUTING_KEYS.USER_UPDATED, user);
+      }
+    } catch (err) {
+      console.error('[users] publish error:', err.message);
     }
-  } catch (err) {
-    console.error('[users] publish error:', err.message);
+    
+    res.status(200).json(user);
+
+  } catch (error) {
+    if (error.code === 'P2025') { // 'Record to update not found'
+      return res.status(404).json({ error: 'user not found' });
+    }
+    console.error(error);
+    res.status(500).json({ error: 'Falha ao atualizar usuário' });
   }
-
-  res.status(200).json(user); // Retorna o usuário atualizado
 });
 
-app.get('/:id', (req, res) => {
-  const user = users.get(req.params.id);
-  if (!user) return res.status(404).json({ error: 'user not found' });
-  res.json(user);
+app.get('/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: id }
+    });
+    if (!user) return res.status(404).json({ error: 'user not found' });
+    res.json(user);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Falha ao buscar usuário' });
+  }
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`[users] listening on http://localhost:${PORT}`);
+});
+
+process.on('SIGTERM', async () => {
+  console.log('SIGTERM signal received: closing HTTP server');
+  await prisma.$disconnect();
+  server.close(() => {
+    console.log('HTTP server closed');
+  });
 });
