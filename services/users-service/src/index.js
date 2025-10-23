@@ -1,9 +1,11 @@
 import express from 'express';
 import morgan from 'morgan';
+
 // import { nanoid } from 'nanoid';
 import { createChannel } from './amqp.js';
 import { ROUTING_KEYS } from '../common/events.js';
 import { PrismaClient } from '@prisma/client';
+import { retryWithBackoff } from './utils.js';
 
 const app = express();
 app.use(express.json());
@@ -21,10 +23,18 @@ const EXCHANGE = process.env.EXCHANGE || 'app.topic';
 let amqp = null;
 (async () => {
   try {
-    amqp = await createChannel(RABBITMQ_URL, EXCHANGE);
-    console.log('[users] AMQP connected');
+    // 2. Defina a função que o retry deve executar
+    const connectToAmqp = () => createChannel(RABBITMQ_URL, EXCHANGE);
+    
+    // 3. Execute a conexão com o retry
+    amqp = await retryWithBackoff(connectToAmqp, 5, 2000, 'Users-AMQP-Connection');
+    
+    // O console.log de sucesso já está no helper, mas podemos adicionar um aqui se quisermos.
+    // console.log('[users] AMQP connected');
   } catch (err) {
-    console.error('[users] AMQP connection failed:', err.message);
+    console.error('[users] Falha ao conectar ao AMQP após todas as tentativas:', err.message);
+    // Em um sistema real, poderíamos parar o serviço se o AMQP for vital
+    // process.exit(1); 
   }
 })();
 

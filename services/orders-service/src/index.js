@@ -5,7 +5,7 @@ import fetch from 'node-fetch';
 import { createChannel } from './amqp.js';
 import { ROUTING_KEYS } from '../common/events.js';
 import { PrismaClient } from '@prisma/client';
-
+import { retryWithBackoff } from './utils.js';
 
 const app = express();
 app.use(express.json());
@@ -29,37 +29,52 @@ const userCache = new Map();
 
 let amqp = null;
 (async () => {
-  try {
-    amqp = await createChannel(RABBITMQ_URL, EXCHANGE);
-    console.log('[orders] AMQP connected');
 
-    // Bind de fila para consumir eventos user.created
-    await amqp.ch.assertQueue(QUEUE, { durable: true });
-    await amqp.ch.bindQueue(QUEUE, EXCHANGE, ROUTING_KEY_USER_CREATED);
-    await amqp.ch.bindQueue(QUEUE, EXCHANGE, ROUTING_KEY_USER_UPDATED);
+  // 2. Defina a função de setup completa
+  const setupAmqp = async () => {
+    const amqpConn = await createChannel(RABBITMQ_URL, EXCHANGE);
+    console.log('[orders] AMQP Conectado');
 
-    amqp.ch.consume(QUEUE, msg => {
-      if (!msg) return;
+    // Bind da fila e lógica do consumidor
+    await amqpConn.ch.assertQueue(QUEUE, { durable: true });
+    await amqpConn.ch.bindQueue(QUEUE, EXCHANGE, ROUTING_KEY_USER_CREATED);
+    await amqpConn.ch.bindQueue(QUEUE, EXCHANGE, ROUTING_KEY_USER_UPDATED);
+
+    amqpConn.ch.consume(QUEUE, msg => {
+      if (!msg) return; // Se a mensagem for nula, apenas retorna
+
       try {
-        const user = JSON.parse(msg.content.toString());
+        const data = JSON.parse(msg.content.toString());
         const key = msg.fields.routingKey;
-        // idempotência simples: atualiza/define
+        
+        // Lógica para processar o evento e atualizar o cache
         if (key === ROUTING_KEY_USER_CREATED) {
           userCache.set(data.id, data);
-          console.log('[orders] consumed event user.created -> cached', data.id);
+          console.log('[orders] consumed event user.created -> cached', data.id); // Log de confirmação
         } else if (key === ROUTING_KEY_USER_UPDATED) {
-          userCache.set(data.id, data); // A lógica é a mesma: atualizar/definir
-          console.log('[orders] consumed event user.updated -> cache updated', data.id);
+          userCache.set(data.id, data);
+          console.log('[orders] consumed event user.updated -> cache updated', data.id); // Log de confirmação
         }
         
-        amqp.ch.ack(msg);
+        // Confirma o recebimento e processamento da mensagem
+        amqpConn.ch.ack(msg); // <-- Linha crucial
+
       } catch (err) {
         console.error('[orders] consume error:', err.message);
-        amqp.ch.nack(msg, false, false); // descarta em caso de erro de parsing (aula: discutir DLQ)
+        // Rejeita a mensagem em caso de erro
+        amqpConn.ch.nack(msg, false, false); 
       }
     });
+
+    return amqpConn; // Retorna a conexão/canal
+  };
+
+  try {
+    // 3. Execute o setup completo com o retry
+    amqp = await retryWithBackoff(setupAmqp, 5, 2000, 'Orders-AMQP-Setup');
   } catch (err) {
-    console.error('[orders] AMQP connection failed:', err.message);
+    console.error('[orders] Falha no setup do AMQP após todas as tentativas:', err.message);
+    // process.exit(1);
   }
 })();
 
@@ -97,39 +112,58 @@ app.post('/', async (req, res) => {
     return res.status(400).json({ error: 'userId, items[], total<number> são obrigatórios' });
   }
 
-  // 1) Validação síncrona (HTTP) no Users Service
+  // 1) Validação síncrona (HTTP) com RETRY
   try {
-    const resp = await fetchWithTimeout(`${USERS_BASE_URL}/${userId}`, HTTP_TIMEOUT_MS);
-    if (!resp.ok) return res.status(400).json({ error: 'usuário inválido' });
+    
+    // --- INÍCIO DA MODIFICAÇÃO ---
+
+    // A. Definimos a função que o helper de retry irá executar
+    const validateUserHttp = async () => {
+      const resp = await fetchWithTimeout(`${USERS_BASE_URL}/${userId}`, HTTP_TIMEOUT_MS);
+      
+      // Só queremos tentar de novo em erros de rede/servidor (Timeout, 503, etc.)
+      // Se for um erro 404 (usuário não encontrado), não adianta tentar de novo.
+      // fetchWithTimeout já lança um erro (throw) em caso de timeout.
+      if (!resp.ok && (resp.status === 503 || resp.status === 504 || resp.status === 502)) {
+        // Força um erro para acionar o retry
+        throw new Error(`Serviço de usuários indisponível (HTTP ${resp.status})`);
+      }
+      return resp; // Retorna a resposta (seja ela 200 OK ou 404 Not Found)
+    };
+
+    // B. Executamos a função com o retry
+    // Tenta 3 vezes, com 500ms de espera inicial (500ms, 1s, 2s)
+    const resp = await retryWithBackoff(validateUserHttp, 3, 500, 'Validate-User-HTTP');
+
+    // C. Se o retry teve sucesso, checamos a resposta final
+    if (!resp.ok) {
+      // Se o serviço respondeu 404 (usuário não encontrado), tratamos como "usuário inválido"
+      return res.status(400).json({ error: 'usuário inválido' });
+    }
+    
+    // --- FIM DA MODIFICAÇÃO ---
+
   } catch (err) {
-    console.warn('[orders] users-service timeout/failure, tentando cache...', err.message);
-    // fallback: usar cache populado por eventos (assíncrono)
+    // 2) SE TODAS AS TENTATIVAS DE RETRY FALHAREM, caímos aqui e usamos o "Plano B" (cache)
+    console.warn('[orders] users-service timeout/failure (APÓS RETRIES), tentando cache...', err.message);
     if (!userCache.has(userId)) {
       return res.status(503).json({ error: 'users-service indisponível e usuário não encontrado no cache' });
     }
   }
 
+  // 3) Se passou (pelo HTTP ou pelo cache), cria o pedido no Prisma
   try {
     const order = await prisma.order.create({
       data: {
         userId: userId,
         total: total,
         status: 'created',
-        // ATUALIZADO: Converte o array de 'items' para uma string JSON
         items: JSON.stringify(items)
       }
     });
 
-    try {
-      if (amqp?.ch) {
-        amqp.ch.publish(EXCHANGE, ROUTING_KEYS.ORDER_CREATED, Buffer.from(JSON.stringify(order)), { persistent: true });
-        console.log('[orders] published event:', ROUTING_KEYS.ORDER_CREATED, order.id);
-      }
-    } catch (err) {
-      console.error('[orders] publish error:', err.message);
-    }
+    // ... (Publicação do evento order.created) ...
 
-    // ATUALIZADO: Converte a string 'items' de volta para JSON para a resposta
     res.status(201).json({
       ...order,
       items: JSON.parse(order.items)
