@@ -12,7 +12,8 @@
     "express": "^4.19.2",
     "morgan": "^1.10.0",
     "node-fetch": "^3.3.2",
-    "nanoid": "^5.0.7"
+    "nanoid": "^5.0.7",
+    "swagger-ui-express": "^5.0.0"
   },
   "devDependencies": {
     "prisma": "^5.0.0"
